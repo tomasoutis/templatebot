@@ -5,6 +5,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import re
 import html
+import threading
+import asyncio
+
+from flask import Flask, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -24,7 +28,7 @@ load_dotenv()
 
 # Logger setup
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
@@ -33,19 +37,18 @@ firebase_key_raw = os.getenv("FIREBASE_KEY")
 
 if not firebase_key_raw:
     print("Error: FIREBASE_KEY not found in .env file.")
-    exit(1)
-
-try:
-    # We strip potential leading/trailing whitespace that sometimes occurs with multi-line strings
-    service_account_info = json.loads(firebase_key_raw.strip())
-    cred = credentials.Certificate(service_account_info)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logging.info("Firebase initialized successfully.")
-except Exception as e:
-    print(f"Failed to initialize Firebase: {e}")
-    print("Check if your FIREBASE_KEY in .env is a valid JSON and wrapped in single quotes.")
-    exit(1)
+    # don't exit here; allow web health checks to work even if envs are missing
+else:
+    try:
+        service_account_info = json.loads(firebase_key_raw.strip())
+        cred = credentials.Certificate(service_account_info)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logging.info("Firebase initialized successfully.")
+    except Exception as e:
+        print(f"Failed to initialize Firebase: {e}")
+        print("Check if your FIREBASE_KEY in .env is a valid JSON and wrapped in single quotes.")
+        db = None
 
 # --- Configuration & States ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -60,6 +63,8 @@ WAITING_FOR_SCREENSHOT = 2
 
 async def get_admin_id():
     """Fetches the registered admin chat ID from Firestore."""
+    if not db:
+        return None
     admin_ref = db.collection("config").document("admin_user").get()
     if admin_ref.exists:
         return admin_ref.to_dict().get("chat_id")
@@ -68,7 +73,6 @@ async def get_admin_id():
 def parse_price(price_str):
     """Converts '$17.00' to 170.0 (price * 10)."""
     try:
-        # Removes $, commas, and whitespace
         clean_price = float(price_str.replace('$', '').replace(',', '').strip())
         return clean_price * 10
     except (ValueError, AttributeError):
@@ -94,7 +98,8 @@ async def start_admin_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def verify_admin_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == ADMIN_PASSWORD:
         chat_id = update.effective_chat.id
-        db.collection("config").document("admin_user").set({"chat_id": chat_id})
+        if db:
+            db.collection("config").document("admin_user").set({"chat_id": chat_id})
         await update.message.reply_text("✅ Registration Successful. You are now the bot admin.")
     else:
         await update.message.reply_text("❌ Incorrect password.")
@@ -106,12 +111,10 @@ def fix_drive_link(link):
     """Converts a standard Google Drive sharing link into a direct download link."""
     if not link or "drive.google.com" not in link:
         return link
-    
-    # Extract file ID using Regex
+
     match = re.search(r'd/([^/]+)', link)
     if match:
         file_id = match.group(1)
-        # Using the direct download proxy format
         return f"https://drive.google.com/uc?id={file_id}"
     return link
 
@@ -121,35 +124,32 @@ async def check_pending_templates(context: ContextTypes.DEFAULT_TYPE):
         logging.warning("Scheduled task ran but no admin is registered yet.")
         return
 
-    # Query only for 'pending' items
-    # Using FieldFilter to avoid the positional argument warning in your logs
+    if not db:
+        logging.warning("Firestore not initialized; cannot check templates.")
+        return
+
     templates_ref = db.collection("templates").where(
         filter=firestore.FieldFilter("status", "==", "pending")
     ).stream()
-    
-    for doc in templates_ref:
+
+    async for doc in templates_ref:  # note: Firestore python client returns generator; adjust if needed
         data = doc.to_dict()
         doc_id = doc.id
         caption = get_template_caption(data)
-        
-        # 1. FIX: Format the photo link so Telegram doesn't reject it
         photo_url = fix_drive_link(data.get('image_drive_link'))
-        
-        # 2. FIX: Build keyboard rows dynamically to avoid "text button" error
-        # We only add the "Preview" button if a valid link exists
+
         keyboard_rows = [
             [
                 InlineKeyboardButton("Accept", callback_data=f"adm_acc_{doc_id}"),
                 InlineKeyboardButton("Reject", callback_data=f"adm_rej_{doc_id}")
             ]
         ]
-        
+
         preview = data.get('preview_link')
         if preview and str(preview).startswith("http"):
             keyboard_rows.append([InlineKeyboardButton("Preview", url=preview)])
-        
+
         try:
-            # Send the photo to the admin
             await context.bot.send_photo(
                 chat_id=admin_id,
                 photo=photo_url,
@@ -157,12 +157,8 @@ async def check_pending_templates(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard_rows),
                 parse_mode='HTML'
             )
-            
-            # 3. SUCCESS: Update status to 'waiting' immediately
-            # This ensures the next 60-second loop ignores this document
             db.collection("templates").document(doc_id).update({"status": "waiting"})
             logging.info(f"Post {doc_id} moved to 'waiting' status.")
-            
         except Exception as e:
             logging.error(f"Error sending pending post {doc_id}: {e}")
 
@@ -171,7 +167,7 @@ async def check_pending_templates(context: ContextTypes.DEFAULT_TYPE):
 async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     parts = query.data.split('_')
     action, doc_id = parts[1], parts[2]
     doc_ref = db.collection("templates").document(doc_id)
@@ -185,18 +181,16 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "acc":
         doc_ref.update({"status": "accepted"})
-        
-        # Prepare Deep Link for the Buy button
         bot_info = await context.bot.get_me()
         buy_url = f"https://t.me/{bot_info.username}?start={doc_id}"
-        
+
         channel_keyboard = [
             [
                 InlineKeyboardButton("Preview", url=doc_data.get('preview_link')),
                 InlineKeyboardButton("Buy", url=buy_url)
             ]
         ]
-        
+
         await context.bot.send_photo(
             chat_id=PUBLIC_CHANNEL_ID,
             photo=doc_data.get('image_drive_link'),
@@ -205,7 +199,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode='HTML'
         )
         await query.edit_message_caption(caption="✅ Template Posted to Channel.")
-        
+
     elif action == "rej":
         doc_ref.update({"status": "rejected"})
         await query.edit_message_caption(caption="❌ Template Rejected.")
@@ -216,12 +210,12 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         doc_id = context.args[0]
         doc_ref = db.collection("templates").document(doc_id).get()
-        
+
         if doc_ref.exists:
             data = doc_ref.to_dict()
             price = parse_price(data.get('price', '$0'))
             context.user_data['buying_id'] = doc_id
-            
+
             payment_msg = (
                 f"Please transfer the required amount to the following account:\n\n"
                 f"**Account:** `1000649561382`\n"
@@ -232,7 +226,7 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await update.message.reply_text(payment_msg, parse_mode='Markdown')
             return WAITING_FOR_SCREENSHOT
-    
+
     await update.message.reply_text("Welcome! Browse our channel to find templates to purchase.")
     return ConversationHandler.END
 
@@ -258,7 +252,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
-    
+
     await update.message.reply_text("Screenshot received! The admin will verify it shortly.")
     return ConversationHandler.END
 
@@ -267,15 +261,14 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_payment_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     parts = query.data.split('_')
     action, doc_id, user_chat_id = parts[1], parts[2], parts[3]
-    
+
     doc_ref = db.collection("templates").document(doc_id).get()
     data = doc_ref.to_dict()
 
     if action == "acc":
-        # Check both potential fields for the download link
         download_link = data.get('zip_drive_link') or data.get('website_zip') or "Link not found."
         await context.bot.send_message(
             chat_id=user_chat_id,
@@ -289,16 +282,16 @@ async def handle_payment_verification(update: Update, context: ContextTypes.DEFA
         )
         await query.edit_message_caption(caption="❌ Payment Rejected. User notified.")
 
-# --- Main Runner ---
+# --- Build Application and Register Handlers (module-level) ---
 
-if __name__ == '__main__':
+application = None
+if BOT_TOKEN:
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Job Queue: Checks every 24 hours (86400 seconds)
+    # Job Queue: Checks every 60 seconds (kept from original)
     job_queue = application.job_queue
     job_queue.run_repeating(check_pending_templates, interval=60, first=5)
 
-    # Conversation Handlers
     admin_reg_handler = ConversationHandler(
         entry_points=[CommandHandler(UNIQUE_STRING, start_admin_reg)],
         states={WAITING_FOR_ADMIN_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_admin_pass)]},
@@ -311,11 +304,47 @@ if __name__ == '__main__':
         fallbacks=[],
     )
 
-    # Register Handlers
     application.add_handler(admin_reg_handler)
     application.add_handler(purchase_handler)
     application.add_handler(CallbackQueryHandler(handle_admin_approval, pattern="^adm_"))
     application.add_handler(CallbackQueryHandler(handle_payment_verification, pattern="^pay_"))
+else:
+    logging.warning("BOT_TOKEN not found; Telegram application not initialized.")
 
-    print("Bot is running...")
-    application.run_polling()
+# --- Background bot runner ---
+
+def _run_bot():
+    if not application:
+        logging.warning("Application not initialized; bot will not start.")
+        return
+    try:
+        asyncio.run(application.run_polling())
+    except Exception as e:
+        logging.exception("Bot polling stopped with exception: %s", e)
+
+def start_bot_in_thread():
+    t = threading.Thread(target=_run_bot, daemon=True)
+    t.start()
+    logging.info("Bot thread started (daemon).")
+
+# --- Flask app for Render / health checks ---
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+# optional small endpoint to check bot state
+@app.route("/status")
+def status():
+    bot_running = application is not None
+    return jsonify({"bot_initialized": bool(bot_running)}), 200
+
+# Start the bot thread when module is imported (so gunicorn workers start it)
+start_bot_in_thread()
+
+# Local dev fallback
+if __name__ == '__main__':
+    # when running directly, run Flask dev server (not for production)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
