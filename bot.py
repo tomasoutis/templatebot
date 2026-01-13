@@ -317,10 +317,38 @@ def _run_bot():
     if not application:
         logging.warning("Application not initialized; bot will not start.")
         return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _runner():
+        try:
+            await application.initialize()
+            await application.start()
+            # Start polling (this is a coroutine and must be awaited)
+            await application.updater.start_polling()
+            # keep running until the process exits
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("Exception in bot runner")
+        finally:
+            try:
+                await application.updater.stop_polling()
+            except Exception:
+                pass
+            try:
+                await application.stop()
+                await application.shutdown()
+            except Exception:
+                pass
+
     try:
-        asyncio.run(application.run_polling())
-    except Exception as e:
-        logging.exception("Bot polling stopped with exception: %s", e)
+        loop.run_until_complete(_runner())
+    finally:
+        loop.close()
+
 
 def start_bot_in_thread():
     t = threading.Thread(target=_run_bot, daemon=True)
