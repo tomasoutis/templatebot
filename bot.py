@@ -132,7 +132,7 @@ async def check_pending_templates(context: ContextTypes.DEFAULT_TYPE):
         filter=firestore.FieldFilter("status", "==", "pending")
     ).stream()
 
-    async for doc in templates_ref:  # note: Firestore python client returns generator; adjust if needed
+    for doc in templates_ref:  # Change 'async for' to 'for'
         data = doc.to_dict()
         doc_id = doc.id
         caption = get_template_caption(data)
@@ -288,9 +288,9 @@ application = None
 if BOT_TOKEN:
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Job Queue: Checks every 60 seconds (kept from original)
+    # Job Queue: Checks every 86400 seconds (kept from original)
     job_queue = application.job_queue
-    job_queue.run_repeating(check_pending_templates, interval=60, first=5)
+    job_queue.run_repeating(check_pending_templates, interval=86400, first=5)
 
     admin_reg_handler = ConversationHandler(
         entry_points=[CommandHandler(UNIQUE_STRING, start_admin_reg)],
